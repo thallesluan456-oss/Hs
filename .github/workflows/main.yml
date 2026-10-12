@@ -1,0 +1,87 @@
+name: Windows RDP - Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_user:
+        description: 'Usuario RDP'
+        required: false
+        default: 'runneradmin'
+      rdp_password:
+        description: 'Senha RDP (min 8 chars)'
+        required: false
+        default: 'WindowsRDP#2025'
+      keep_alive_minutes:
+        description: 'Minutos ativo (max 350)'
+        required: false
+        default: '350'
+
+jobs:
+  remote-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup RDP User
+        shell: powershell
+        env:
+          RDP_USER: ${{ github.event.inputs.rdp_user }}
+          RDP_PASS: ${{ github.event.inputs.rdp_password }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $User = if ([string]::IsNullOrWhiteSpace($env:RDP_USER)) { "runneradmin" } else { $env:RDP_USER }
+          $Pass = if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) { "WindowsRDP#2025" } else { $env:RDP_PASS }
+          $SecurePass = ConvertTo-SecureString $Pass -AsPlainText -Force
+          if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $User -Password $SecurePass
+          } else {
+              New-LocalUser -Name $User -Password $SecurePass -FullName $User -PasswordNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $User -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $User -ErrorAction SilentlyContinue
+          "RDP_USERNAME=$User" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$Pass" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "::add-mask::$Pass"
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Install Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: latest
+          args: --hostname=gh-rdp-${{ github.run_id }}
+
+      - name: Get IP + Firewall
+        shell: powershell
+        run: |
+          $tsIP = (tailscale ip -4).Trim()
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -InterfaceAlias "Tailscale" -Action Allow -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -DisplayName "Remote Desktop*" -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+
+      - name: Connection Info
+        shell: powershell
+        run: |
+          Write-Host "========== RDP =========="
+          Write-Host "IP:   $env:TAILSCALE_IP"
+          Write-Host "User: $env:RDP_USERNAME"
+          Write-Host "Pass: $env:RDP_PASSWORD"
+          Write-Host "========================="
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          $min = [int]"${{ github.event.inputs.keep_alive_minutes }}"
+          if ($min -gt 350) { $min = 350 }
+          Write-Host "Ativo por $min minutos..."
+          Start-Sleep -Seconds ($min * 60)
